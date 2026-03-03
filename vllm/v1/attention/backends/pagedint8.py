@@ -83,11 +83,11 @@ class Int8PageAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "FLASH_ATTN"
+        return "INT8_PAGE_ATTN"
 
     @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
-        """FlashAttention supports all attention types."""
+        """Int8PageAttention supports all attention types."""
         return attn_type in (
             AttentionType.DECODER,
             AttentionType.ENCODER,
@@ -101,12 +101,12 @@ class Int8PageAttentionBackend(AttentionBackend):
         return fa_version is not None and fa_version >= 3
 
     @staticmethod
-    def get_impl_cls() -> type["FlashAttentionImpl"]:
-        return FlashAttentionImpl
+    def get_impl_cls() -> type["INT8PAttnImpl"]:
+        return INT8PAttnImpl
 
     @staticmethod
-    def get_builder_cls() -> type["FlashAttentionMetadataBuilder"]:
-        return FlashAttentionMetadataBuilder
+    def get_builder_cls() -> type["INT8PAGEDATTENMetadataBuilder"]:
+        return INT8PAGEDATTENMetadataBuilder
 
     @staticmethod
     def get_kv_cache_shape(
@@ -199,7 +199,7 @@ class Int8PageAttentionBackend(AttentionBackend):
 
 
 @dataclass
-class FlashAttentionMetadata:
+class INT8PAGEDATTENMetadata:
     # NOTE(sang): Definition of context_len, query_len, and seq_len.
     # |---------- N-1 iteration --------|
     # |---------------- N iteration ---------------------|
@@ -242,14 +242,14 @@ def _get_sliding_window_configs(
     sliding_window_configs: set[tuple[int, int] | None] = set()
     layers = get_layers_from_vllm_config(vllm_config, Attention)
     for layer in layers.values():
-        assert isinstance(layer.impl, FlashAttentionImpl)
+        assert isinstance(layer.impl, INT8PAttnImpl)
         sliding_window_configs.add(layer.impl.sliding_window)
     return sliding_window_configs
 
 
 # 把 vLLM 高层通用的注意力请求，转换为 FlashAttention 底层算子能看懂的特定数据结构，
 # 同时处理 CUDA Graph 捕获、AOT 调度、Paged KV Cache 等高级特性
-class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetadata]):
+class INT8PAGEDATTENMetadataBuilder(AttentionMetadataBuilder[INT8PAGEDATTENMetadata]):
     # FA3:
     # Supports full cudagraphs for all cases.
     #
@@ -358,7 +358,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> FlashAttentionMetadata:
+    ) -> INT8PAGEDATTENMetadata:
         """
         fast_build disables AOT scheduling, used when there will be few
         iterations i.e. spec-decode
@@ -516,7 +516,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
-        attn_metadata = FlashAttentionMetadata(
+        attn_metadata = INT8PAGEDATTENMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
             query_start_loc=query_start_loc,
@@ -540,20 +540,21 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
     def update_block_table(
         self,
-        metadata: FlashAttentionMetadata,
+        metadata: INT8PAGEDATTENMetadata,
         blk_table: torch.Tensor,
         slot_mapping: torch.Tensor,
-    ) -> FlashAttentionMetadata:
+    ) -> INT8PAGEDATTENMetadata:
         new_metadata = copy.copy(metadata)
         new_metadata.block_table = blk_table
         new_metadata.slot_mapping = slot_mapping
         return new_metadata
 
+    # 把这个禁用
     def use_cascade_attention(self, *args, **kwargs) -> bool:
-        return use_cascade_attention(*args, **kwargs)
+        return False
 
 
-class FlashAttentionImpl(AttentionImpl):
+class INT8PAttnImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
 
     def __init__(
@@ -631,26 +632,11 @@ class FlashAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata,
+        attn_metadata: INT8PAGEDATTENMetadata,
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward pass with FlashAttention.
-
-        Args:
-            query: shape = [num_tokens, num_heads, head_size]
-            key: shape = [num_tokens, num_kv_heads, head_size]
-            value: shape = [num_tokens, num_kv_heads, head_size]
-            kv_cache: shape =
-                [2, num_blocks, block_size, num_kv_heads, head_size]
-            attn_metadata: Metadata for attention.
-        Returns:
-            shape = [num_tokens, num_heads * head_size]
-        NOTE: FP8 quantization, flash-attn expect the size of
-              {q,k,v}_descale to be (num_sequences, num_kv_heads).
-              We use torch's .expand() to avoid duplicating values
-        """
         assert output is not None, "Output tensor must be provided."
         assert self.vllm_flash_attn_version is not None, (
             "FlashAttention version not detected."
@@ -658,153 +644,171 @@ class FlashAttentionImpl(AttentionImpl):
 
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
-                "fused output quantization is not yet supported for FlashAttentionImpl"
+                "fused output quantization is not yet supported for INT8PAttnImpl"
             )
 
         if attn_metadata is None:
-            # Profiling run.
             return output.fill_(0)
 
         attn_type = self.attn_type
-
-        # IMPORTANT!
-        # NOTE(woosuk): With piece-wise CUDA graphs, this method is executed in
-        # eager-mode PyTorch. Thus, we need to be careful about any CPU overhead
-        # in this method. For example, `view` and `slice` (or `[:n]`) operations
-        # are surprisingly slow even in the case they do not invoke any GPU ops.
-        # Minimize the PyTorch ops in this method as much as possible.
-        # Whenever making a change in this method, please benchmark the
-        # performance to make sure it does not introduce any overhead.
-
         num_actual_tokens = attn_metadata.num_actual_tokens
+        # 保存原始dtype（用于反量化恢复）
+        target_dtype = query.dtype
 
-        # Handle encoder attention differently - no KV cache needed
+        # -------------------------- Encoder Attention --------------------------
         if attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
-            # For encoder attention,
-            # we use direct Q, K, V tensors without caching
+            # Encoder模式：Q/K/V都做INT8量化
+            if self.is_int8_kv:
+                # 计算Q/K/V缩放因子
+                q_scale = self._calc_scale_int8(query[:num_actual_tokens])
+                k_scale = self._calc_scale_int8(key[:num_actual_tokens])
+                v_scale = self._calc_scale_int8(value[:num_actual_tokens])
+                
+                # 量化+反量化（模拟推理流程）
+                query_quant = self._quantize_int8(query[:num_actual_tokens], q_scale)
+                key_quant = self._quantize_int8(key[:num_actual_tokens], k_scale)
+                value_quant = self._quantize_int8(value[:num_actual_tokens], v_scale)
+                
+                query_dequant = self._dequantize_int8(query_quant, q_scale, target_dtype)
+                key_dequant = self._dequantize_int8(key_quant, k_scale, target_dtype)
+                value_dequant = self._dequantize_int8(value_quant, v_scale, target_dtype)
+            else:
+                query_dequant = query[:num_actual_tokens]
+                key_dequant = key[:num_actual_tokens]
+                value_dequant = value[:num_actual_tokens]
+
             return self._forward_encoder_attention(
-                query[:num_actual_tokens],
-                key[:num_actual_tokens],
-                value[:num_actual_tokens],
+                query_dequant,
+                key_dequant,
+                value_dequant,
                 output[:num_actual_tokens],
                 attn_metadata,
                 layer,
             )
 
-        # For decoder and cross-attention, use KV cache as before
+        # -------------------------- Decoder Attention --------------------------
         key_cache, value_cache = kv_cache.unbind(0)
+        query_actual = query[:num_actual_tokens]
+        key_actual = key[:num_actual_tokens]
+        value_actual = value[:num_actual_tokens]
+        output_actual = output[:num_actual_tokens]
 
-        # 【INT8 新增】INT8 KV Cache 反量化逻辑
+        # INT8量化/反量化核心逻辑
+        q_descale = k_descale = v_descale = None
         if self.is_int8_kv:
-            # 1. 从 KV Cache 读取量化后的 Key/Value
+            # 1. KV Cache反量化
             key_cache_int8 = key_cache.view(torch.int8)
             value_cache_int8 = value_cache.view(torch.int8)
             
-            # 2. 从 self 获取缩放因子并反量化
             k_scale = self._int8_k_scale
             v_scale = self._int8_v_scale
             
             if k_scale is not None and v_scale is not None:
-                # 反量化为与 Query 相同的 dtype（通常是 BF16/FP16）
-                target_dtype = query.dtype
-                key_cache = key_cache_int8.to(target_dtype) * k_scale[None, :, None]
-                value_cache = value_cache_int8.to(target_dtype) * v_scale[None, :, None]
+                # 恢复缩放因子维度：[num_kv_heads] -> [1, num_kv_heads, 1]
+                k_scale = k_scale.unsqueeze(0).unsqueeze(-1)
+                v_scale = v_scale.unsqueeze(0).unsqueeze(-1)
+                
+                # 反量化并恢复原始dtype
+                key_cache = self._dequantize_int8(key_cache_int8, k_scale, target_dtype)
+                value_cache = self._dequantize_int8(value_cache_int8, v_scale, target_dtype)
+
+            # 2. Query量化（和KV精度匹配）
+            q_scale = self._calc_scale_int8(query_actual)
+            query_quant = self._quantize_int8(query_actual, q_scale)
+            query_actual = self._dequantize_int8(query_quant, q_scale, target_dtype)
+            
+            # 3. 当前step的K/V量化（可选，保持一致性）
+            k_scale_curr = self._calc_scale_int8(key_actual)
+            v_scale_curr = self._calc_scale_int8(value_actual)
+            
+            key_quant = self._quantize_int8(key_actual, k_scale_curr)
+            value_quant = self._quantize_int8(value_actual, v_scale_curr)
+            
+            key_actual = self._dequantize_int8(key_quant, k_scale_curr, target_dtype)
+            value_actual = self._dequantize_int8(value_quant, v_scale_curr, target_dtype)
+
+            # 4. 准备descale参数（供FlashAttention使用）
+            descale_shape = (attn_metadata.query_start_loc.shape[0] - 1, self.num_kv_heads)
+            q_descale = q_scale.squeeze(0).squeeze(-1).expand(descale_shape)
+            k_descale = k_scale.squeeze(0).squeeze(-1).expand(descale_shape)
+            v_descale = v_scale.squeeze(0).squeeze(-1).expand(descale_shape)
 
         elif self.kv_cache_dtype.startswith("fp8"):
-            # queries are quantized in the attention layer
-            dtype = FlashAttentionBackend.get_fp8_dtype_for_flashattn(
-                self.kv_cache_dtype
-            )
+            dtype = Int8PageAttentionBackend.get_fp8_dtype_for_flashattn(self.kv_cache_dtype)
             key_cache = key_cache.view(dtype)
             value_cache = value_cache.view(dtype)
 
-        if not attn_metadata.use_cascade:
-            cu_seqlens_q = attn_metadata.query_start_loc
-            seqused_k = attn_metadata.seq_lens
-            max_seqlen_q = attn_metadata.max_query_len
-            max_seqlen_k = attn_metadata.max_seq_len
-            block_table = attn_metadata.block_table
-            scheduler_metadata = attn_metadata.scheduler_metadata
+        # ========== 关键修复：调用Decoder Attention核心计算 ==========
+        if self.dcp_world_size > 1:
+            # DCP模式：调用_forward_with_dcp
+            self._forward_with_dcp(
+                query_actual,
+                key_actual,
+                value_actual,
+                key_cache,
+                value_cache,
+                output_actual,
+                attn_metadata,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
+        else:
+            # 非DCP模式：直接调用FlashAttention
+            seqused_k = attn_metadata.seq_lens[:attn_metadata.query_start_loc.shape[0]-1]
+            sliding_window_size = list(self.sliding_window) if self.sliding_window is not None else None
+            from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+            flash_attn_varlen_func(
+                q=query_actual,
+                k=key_cache,  # Paged Attention使用KV Cache中的K
+                v=value_cache,  # Paged Attention使用KV Cache中的V
+                out=output_actual,
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.max_query_len,
+                # 关键1：传入seqused_k（必须和block_table同时传）
+                seqused_k=seqused_k,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                # 关键2：传入block_table（分页KV Cache的块表）
+                block_table=attn_metadata.block_table,
+                softcap=self.logits_soft_cap,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                num_splits=attn_metadata.max_num_splits,
+                # 关键3：传入scheduler_metadata（FA3需要）
+                scheduler_metadata=attn_metadata.scheduler_metadata,
+            )
 
-            descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
-
-            q_descale = layer._q_scale.expand(descale_shape)
-            k_descale = layer._k_scale.expand(descale_shape)
-            v_descale = layer._v_scale.expand(descale_shape)
-
-            if self.dcp_world_size > 1:
-                self._forward_with_dcp(
-                    query[:num_actual_tokens],
-                    key[:num_actual_tokens],
-                    value[:num_actual_tokens],
-                    key_cache,
-                    value_cache,
-                    output[:num_actual_tokens],
-                    attn_metadata,
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                )
-                return output
-            else:
-                sliding_window_size = (
-                    list(self.sliding_window)
-                    if self.sliding_window is not None
-                    else None
-                )
-                flash_attn_varlen_func(
-                    q=query[:num_actual_tokens],
-                    k=key_cache,
-                    v=value_cache,
-                    out=output[:num_actual_tokens],
-                    cu_seqlens_q=cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    seqused_k=seqused_k,
-                    max_seqlen_k=max_seqlen_k,
-                    softmax_scale=self.scale,
-                    causal=attn_metadata.causal,
-                    alibi_slopes=self.alibi_slopes,
-                    window_size=sliding_window_size,
-                    block_table=block_table,
-                    softcap=self.logits_soft_cap,
-                    scheduler_metadata=scheduler_metadata,
-                    fa_version=self.vllm_flash_attn_version,
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    num_splits=attn_metadata.max_num_splits,
-                    s_aux=self.sinks,
-                )
-                return output
-
-        # Cascade attention (rare case).
-        cascade_attention(
-            output[:num_actual_tokens],
-            query[:num_actual_tokens],
-            key_cache,
-            value_cache,
-            cu_query_lens=attn_metadata.query_start_loc,
-            max_query_len=attn_metadata.max_query_len,
-            cu_prefix_query_lens=attn_metadata.cu_prefix_query_lens,
-            prefix_kv_lens=attn_metadata.prefix_kv_lens,
-            suffix_kv_lens=attn_metadata.suffix_kv_lens,
-            max_kv_len=attn_metadata.max_seq_len,
-            softmax_scale=self.scale,
-            alibi_slopes=self.alibi_slopes,
-            sliding_window=self.sliding_window,
-            logits_soft_cap=self.logits_soft_cap,
-            block_table=attn_metadata.block_table,
-            common_prefix_len=attn_metadata.common_prefix_len,
-            max_num_splits=attn_metadata.max_num_splits,
-            fa_version=self.vllm_flash_attn_version,
-            prefix_scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
-            suffix_scheduler_metadata=attn_metadata.scheduler_metadata,
-            q_descale=layer._q_scale,
-            k_descale=layer._k_scale,
-            v_descale=layer._v_scale,
-            s_aux=self.sinks,
-        )
         return output
+
+    def _calc_scale_int8(self, tensor: torch.Tensor) -> torch.Tensor:
+        """计算INT8对称量化的缩放因子（按head维度）"""
+        # tensor shape: [num_tokens, num_heads, head_size]
+        # 按head维度计算abs_max，保留num_heads维度
+        abs_max = tensor.abs().amax(dim=(0, 2), keepdim=True)  # [1, num_heads, 1]
+        # 对称量化缩放因子 = abs_max / 127.0
+        scale = abs_max / 127.0
+        # 避免除零，设置最小阈值
+        scale = scale.clamp_min(1e-6)
+        return scale
+
+    def _quantize_int8(self, tensor: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """INT8对称量化：[-127, 127]"""
+        tensor_scaled = tensor / scale
+        # 裁剪到[-127, 127]，四舍五入后转int8
+        tensor_clipped = torch.clamp(tensor_scaled, -127, 127)
+        tensor_quant = torch.round(tensor_clipped).to(torch.int8)
+        return tensor_quant
+
+    def _dequantize_int8(self, tensor_int8: torch.Tensor, scale: torch.Tensor, target_dtype: torch.dtype) -> torch.Tensor:
+        """INT8反量化，恢复到目标dtype"""
+        tensor_dequant = tensor_int8.to(target_dtype) * scale
+        return tensor_dequant.contiguous()  # 保证内存连续
 
     def do_kv_cache_update(
         self,
@@ -815,50 +819,39 @@ class FlashAttentionImpl(AttentionImpl):
         slot_mapping: torch.Tensor,
     ) -> None:
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
-            # For encoder attention,
-            # we use direct Q, K, V tensors without caching
             return
 
         key_cache, value_cache = kv_cache.unbind(0)
 
-        # 【INT8 新增】INT8 动态量化逻辑
         if self.is_int8_kv:
-            # 1. 动态计算缩放因子（对称量化）
-            # 按 KV Head 维度计算最大值
-            k_abs_max = key.abs().amax(dim=(0, -1), keepdim=False)
-            v_abs_max = value.abs().amax(dim=(0, -1), keepdim=False)
+            # 1. 修复缩放因子计算维度（按num_tokens和head_size求max）
+            # key shape: [num_tokens, num_kv_heads, head_size]
+            k_abs_max = key.abs().amax(dim=(0, 2), keepdim=False)  # [num_kv_heads]
+            v_abs_max = value.abs().amax(dim=(0, 2), keepdim=False)  # [num_kv_heads]
             
-            # 缩放因子 = max(abs) / 127.0（INT8 正数最大值）
+            # 2. 对称量化缩放因子（用127而非128）
             k_scale = k_abs_max / 127.0
             v_scale = v_abs_max / 127.0
             
-            # 避免除零
-            k_scale = k_scale.clamp_min(1e-5)
-            v_scale = v_scale.clamp_min(1e-5)
+            # 3. 避免除零
+            k_scale = k_scale.clamp_min(1e-6)
+            v_scale = v_scale.clamp_min(1e-6)
             
-            # 2. 保存缩放因子到 self（供 forward 时反量化使用）
+            # 4. 保存缩放因子（供forward反量化使用）
             self._int8_k_scale = k_scale
             self._int8_v_scale = v_scale
             
-            # 3. 对 Key/Value 进行量化（对称量化到 INT8）
-            key_int8 = torch.clamp(key / k_scale[None, :, None], -128, 127).to(torch.int8)
-            value_int8 = torch.clamp(value / v_scale[None, :, None], -128, 127).to(torch.int8)
+            # 5. 修复量化范围：[-127, 127]
+            k_scale_exp = k_scale.unsqueeze(0).unsqueeze(-1)  # [1, num_kv_heads, 1]
+            v_scale_exp = v_scale.unsqueeze(0).unsqueeze(-1)
             
-            # 4. 存储量化后的 Key/Value 到 KV Cache
+            key_int8 = torch.clamp(key / k_scale_exp, -127, 127).to(torch.int8)
+            value_int8 = torch.clamp(value / v_scale_exp, -127, 127).to(torch.int8)
+            
+            # 6. 存储量化后的KV到Cache
             key_cache = key_cache.view(torch.int8)
             value_cache = value_cache.view(torch.int8)
             
-            # 调用 reshape_and_cache_flash 存储
-            # reshape_and_cache_flash(
-            #     key_int8,
-            #     value_int8,
-            #     key_cache,
-            #     value_cache,
-            #     slot_mapping,
-            #     self.kv_cache_dtype,
-            #     k_scale,
-            #     v_scale,
-            # )
             from vllm.v1.attention.backends.pagedint8_util import reshape_and_cache_flash_pytorch
             reshape_and_cache_flash_pytorch(
                 key_int8,
@@ -872,13 +865,7 @@ class FlashAttentionImpl(AttentionImpl):
             )
             return
 
-        # Reshape the input keys and values and store them in the cache.
-        # Skip this if sharing KV cache with an earlier attention layer.
-        # NOTE(woosuk): Here, key and value are padded while slot_mapping is
-        # not padded. However, we don't need to do key[:num_actual_tokens]
-        # and value[:num_actual_tokens] because the reshape_and_cache_flash
-        # op uses the slot_mapping's shape to determine the number of
-        # actual tokens.
+        # 原有FP8/默认逻辑
         reshape_and_cache_flash(
             key,
             value,
@@ -898,7 +885,7 @@ class FlashAttentionImpl(AttentionImpl):
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         output: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata,
+        attn_metadata: INT8PAGEDATTENMetadata,
         q_descale: torch.Tensor | None = None,
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
@@ -985,7 +972,7 @@ class FlashAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         output: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata,
+        attn_metadata: INT8PAGEDATTENMetadata,
         layer: torch.nn.Module,
     ) -> torch.Tensor:
         """Forward pass for encoder attention without KV cache.
@@ -1067,174 +1054,3 @@ class FlashAttentionImpl(AttentionImpl):
 
         return output
 
-
-def use_cascade_attention(
-    common_prefix_len: int,
-    query_lens: np.ndarray,
-    num_query_heads: int,
-    num_kv_heads: int,
-    use_alibi: bool,
-    use_sliding_window: bool,
-    use_local_attention: bool,
-    num_sms: int,
-    dcp_world_size: int,
-) -> bool:
-    """Decide whether to use cascade attention.
-
-    This function 1) checks whether cascade attention is supported with the
-    given configuration, and 2) heuristically decides whether using cascade
-    attention can improve performance.
-    """
-    # Too short common prefix. Probably not worth using cascade attention.
-    # We use an arbitrary threshold of 256 tokens. TODO: Tune this threshold.
-    # NOTE(woosuk): This is the common case. We should return False as soon as
-    # possible to avoid any unnecessary computation.
-    if common_prefix_len < 256:
-        return False
-    # Cascade attention is currently not supported with these variants.
-    if use_alibi or use_sliding_window or use_local_attention:
-        return False
-    # Too few queries. Probably not worth using cascade attention.
-    # We use an arbitrary threshold of 8 queries. TODO: Tune this threshold.
-    num_reqs = len(query_lens)
-    if num_reqs < 8:
-        return False
-    # disable cascade attention for DCP
-    if dcp_world_size > 1:
-        return False
-
-    # Heuristics to decide whether using cascade attention is beneficial.
-    # 1. When FlashDecoding is not used for normal attention, cascade attention
-    #    is likely to be faster since it saves memory bandwidth.
-    num_queries_per_kv = num_query_heads // num_kv_heads
-    # The criteria for using FlashDecoding can be found in the following link:
-    # https://github.com/vllm-project/flash-attention/blob/96266b1111111f3d11aabefaf3bacbab6a89d03c/csrc/flash_attn/flash_api.cpp#L535
-    use_flash_decoding = (
-        num_queries_per_kv > 1
-        and not use_sliding_window
-        and not use_alibi
-        and np.all(query_lens == 1)
-    )
-    if not use_flash_decoding:
-        # Use cascade attention.
-        return True
-
-    # 2. When FlashDecoding is used for normal attention, it is not clear
-    #    whether cascade attention is beneficial, because FlashDecoding can
-    #    launch more CTAs than cascade attention.
-    #    We use a simple performance model to compare the two methods.
-    #    NOTE(woosuk): The performance model is very rough and may not be
-    #    accurate.
-    num_tokens = num_reqs
-    # NOTE(woosuk): These are default tile sizes. flash-attn might use
-    # different tile sizes (e.g., 64 or 256) depending on the configuration.
-    q_tile_size = 128
-    kv_tile_size = 128
-    num_prefix_tiles = cdiv(common_prefix_len, kv_tile_size)
-
-    cascade_ctas = num_query_heads * cdiv(num_tokens, q_tile_size)
-    cascade_waves = cdiv(cascade_ctas, num_sms)
-    cascade_time = cascade_waves * num_prefix_tiles
-
-    flash_decoding_ctas = (
-        num_reqs * num_kv_heads * cdiv(num_queries_per_kv, q_tile_size)
-    )
-    flash_decoding_ctas *= num_prefix_tiles
-    flash_decoding_time = cdiv(flash_decoding_ctas, num_sms)
-
-    # Use cascade attention if it is faster than FlashDecoding.
-    return cascade_time < flash_decoding_time
-
-
-def cascade_attention(
-    output: torch.Tensor,
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    cu_query_lens: torch.Tensor,
-    max_query_len: int,
-    cu_prefix_query_lens: torch.Tensor,
-    prefix_kv_lens: torch.Tensor,
-    suffix_kv_lens: torch.Tensor,
-    max_kv_len: int,
-    softmax_scale: float,
-    alibi_slopes: torch.Tensor | None,
-    sliding_window: tuple[int, int],
-    logits_soft_cap: float,
-    block_table: torch.Tensor,
-    common_prefix_len: int,
-    max_num_splits: int,
-    fa_version: int,
-    prefix_scheduler_metadata: torch.Tensor | None = None,
-    suffix_scheduler_metadata: torch.Tensor | None = None,
-    q_descale: torch.Tensor | None = None,
-    k_descale: torch.Tensor | None = None,
-    v_descale: torch.Tensor | None = None,
-    s_aux: torch.Tensor | None = None,
-) -> torch.Tensor:
-    assert alibi_slopes is None, "Cascade attention does not support ALiBi."
-    # TODO: Support sliding window.
-    assert sliding_window == (-1, -1), (
-        "Cascade attention does not support sliding window."
-    )
-
-    num_tokens = query.shape[0]
-    block_size = key_cache.shape[-3]
-    assert common_prefix_len % block_size == 0
-    num_common_kv_blocks = common_prefix_len // block_size
-    assert num_common_kv_blocks > 0
-    descale_shape = (cu_prefix_query_lens.shape[0] - 1, key_cache.shape[-2])
-
-    # Process shared prefix.
-    prefix_output, prefix_lse = flash_attn_varlen_func(
-        q=query,
-        k=key_cache,
-        v=value_cache,
-        cu_seqlens_q=cu_prefix_query_lens,
-        seqused_k=prefix_kv_lens,
-        max_seqlen_q=num_tokens,
-        max_seqlen_k=common_prefix_len,
-        softmax_scale=softmax_scale,
-        causal=False,
-        window_size=list(sliding_window),
-        block_table=block_table[:1],
-        softcap=logits_soft_cap,
-        return_softmax_lse=True,
-        scheduler_metadata=prefix_scheduler_metadata,
-        fa_version=fa_version,
-        q_descale=q_descale.expand(descale_shape) if q_descale is not None else None,
-        k_descale=k_descale.expand(descale_shape) if k_descale is not None else None,
-        v_descale=v_descale.expand(descale_shape) if v_descale is not None else None,
-        # s_aux is incorporated into prefix_lse inside the GPU kernel,
-        # enabling its effect during the final attention merge.
-        s_aux=s_aux,
-        num_splits=1 if vllm_is_batch_invariant() else max_num_splits,
-    )
-
-    descale_shape = (cu_query_lens.shape[0] - 1, key_cache.shape[-2])
-
-    # Process suffix per query.
-    suffix_output, suffix_lse = flash_attn_varlen_func(
-        q=query,
-        k=key_cache,
-        v=value_cache,
-        cu_seqlens_q=cu_query_lens,
-        seqused_k=suffix_kv_lens,
-        max_seqlen_q=max_query_len,
-        max_seqlen_k=max_kv_len - common_prefix_len,
-        softmax_scale=softmax_scale,
-        causal=True,
-        window_size=list(sliding_window),
-        block_table=block_table[:, num_common_kv_blocks:],
-        softcap=logits_soft_cap,
-        return_softmax_lse=True,
-        scheduler_metadata=suffix_scheduler_metadata,
-        fa_version=fa_version,
-        q_descale=q_descale.expand(descale_shape) if q_descale is not None else None,
-        k_descale=k_descale.expand(descale_shape) if k_descale is not None else None,
-        v_descale=v_descale.expand(descale_shape) if v_descale is not None else None,
-        num_splits=1 if vllm_is_batch_invariant() else max_num_splits,
-    )
-
-    # Merge prefix and suffix outputs, and store the result in output.
-    merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)
