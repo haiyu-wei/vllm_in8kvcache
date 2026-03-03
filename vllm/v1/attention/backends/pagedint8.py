@@ -1,19 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-INT8 Paged Attention backend (FlashAttention-style API) — **fixed version**.
-
-Key fixes vs your current file:
-1) Decoder path: **DO NOT dequantize the whole KV cache in forward**.
-   Keep KV cache as int8 and pass per-head descale to the attention op.
-2) KV scales: **initialize once and keep fixed** (stop-gap to prevent context drift).
-   (Block-wise scales are the “correct” long-term design, but this file uses fixed per-head.)
-3) KV write: quantize with round+clamp and write into paged cache via slot_mapping.
-4) Paged attention (PyTorch fallback): supports block_table + seqused_k + int8 dequant.
-
-This file is self-contained: it includes minimal pytorch paged attention + cache write helpers.
-"""
-
 import copy
 from dataclasses import dataclass
 from typing import ClassVar, Optional, Tuple
@@ -63,173 +49,6 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
-
-# -------------------------
-# Simple paged-cache helpers
-# -------------------------
-
-def _compute_dtype_for(q: torch.Tensor) -> torch.dtype:
-    # bfloat16 is safer in fp32 for stability
-    return torch.float32 if q.dtype == torch.bfloat16 else torch.float16
-
-
-def reshape_and_cache_flash_pytorch(
-    key_int8: torch.Tensor,        # [T, Hkv, D] (already int8)
-    value_int8: torch.Tensor,      # [T, Hkv, D] (already int8)
-    key_cache_i8: torch.Tensor,    # [num_blocks, block_size, Hkv, D] int8 view
-    value_cache_i8: torch.Tensor,  # same
-    slot_mapping: torch.Tensor,    # [T], slot = block_id * block_size + token_in_block, or -1
-) -> None:
-    """
-    Minimal paged cache writer matching vLLM KV cache layout:
-      key_cache_i8/value_cache_i8: [num_blocks, block_size, num_kv_heads, head_dim]
-      slot_mapping: flattened token slots
-    """
-    slot_mapping = slot_mapping.flatten()
-    valid = slot_mapping >= 0
-    if valid.sum().item() == 0:
-        return
-
-    slots = slot_mapping[valid].to(torch.int64)
-    k = key_int8[valid]      # [N, Hkv, D]
-    v = value_int8[valid]
-
-    block_size = key_cache_i8.shape[1]
-    block_idx = slots // block_size
-    tok_idx = slots % block_size
-
-    with torch.no_grad():
-        key_cache_i8[block_idx, tok_idx] = k
-        value_cache_i8[block_idx, tok_idx] = v
-
-
-def paged_attention_pytorch(
-    q: torch.Tensor,                         # [total_q, Hq, D]
-    key_cache: torch.Tensor,                 # [num_blocks, block_size, Hkv, D] int8 or fp
-    value_cache: torch.Tensor,               # same
-    cu_seqlens_q: torch.Tensor,              # [B+1]
-    block_table: torch.Tensor,               # [B, max_blocks]
-    seqused_k: torch.Tensor,                 # [B]  (kv length in tokens)
-    softmax_scale: float,
-    causal: bool,
-    k_descale: Optional[torch.Tensor],        # [B, Hkv] if cache int8 else None
-    v_descale: Optional[torch.Tensor],        # [B, Hkv] if cache int8 else None
-    out: torch.Tensor,
-    window_size: Optional[Tuple[int, int]] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    softcap: float = 0.0,
-) -> torch.Tensor:
-    """
-    Simple paged attention (PyTorch), matching vLLM paged-kv semantics.
-    Assumptions for simplicity:
-      - Hq == Hkv (no GQA/MQA). If you need GQA, add head broadcast.
-      - seqused_k gives total kv tokens available for each sequence.
-    """
-    device = q.device
-    B = cu_seqlens_q.numel() - 1
-    Hq = q.shape[1]
-    D = q.shape[2]
-    compute_dtype = _compute_dtype_for(q)
-
-    # out provided by caller
-    for i in range(B):
-        q_start = int(cu_seqlens_q[i].item())
-        q_end = int(cu_seqlens_q[i + 1].item())
-        q_seq = q[q_start:q_end].to(compute_dtype)  # [q_len, H, D]
-        q_len = q_seq.shape[0]
-
-        kv_len = int(seqused_k[i].item())
-        if kv_len <= 0 or q_len == 0:
-            out[q_start:q_end].zero_()
-            continue
-
-        bt = block_table[i]  # [max_blocks]
-        blocks = bt[bt != -1]
-        if blocks.numel() == 0:
-            out[q_start:q_end].zero_()
-            continue
-
-        # gather blocks: [nb, block_size, Hkv, D]
-        kb = key_cache[blocks]
-        vb = value_cache[blocks]
-
-        # flatten tokens: [nb*block_size, Hkv, D] and truncate
-        k_flat = kb.reshape(-1, kb.shape[-2], kb.shape[-1])[:kv_len]
-        v_flat = vb.reshape(-1, vb.shape[-2], vb.shape[-1])[:kv_len]
-
-        # dequant if int8
-        if k_flat.dtype == torch.int8:
-            assert k_descale is not None and v_descale is not None
-            ks = k_descale[i].to(compute_dtype).view(1, -1, 1)  # [1,H,1]
-            vs = v_descale[i].to(compute_dtype).view(1, -1, 1)
-            k_seq = k_flat.to(compute_dtype) * ks
-            v_seq = v_flat.to(compute_dtype) * vs
-        else:
-            k_seq = k_flat.to(compute_dtype)
-            v_seq = v_flat.to(compute_dtype)
-
-        # [q_len,H,D] -> [H,q_len,D]
-        qh = q_seq.permute(1, 0, 2)
-        kh = k_seq.permute(1, 0, 2)
-        vh = v_seq.permute(1, 0, 2)
-
-        assert qh.shape[0] == kh.shape[0], "This simple impl assumes Hq == Hkv."
-
-        scores = torch.matmul(qh, kh.transpose(1, 2)) * softmax_scale  # [H,q,k]
-
-        # causal mask (decoder-like, align q to the tail of kv)
-        if causal:
-            # key positions [0..kv_len-1], query positions correspond to [kv_len-q_len .. kv_len-1]
-            q_pos = torch.arange(q_len, device=device)
-            max_k = (kv_len - q_len) + q_pos  # [q_len]
-            k_pos = torch.arange(kv_len, device=device).view(1, -1)  # [1,kv]
-            mask = k_pos > max_k.view(-1, 1)  # [q_len,kv]
-            min_val = torch.finfo(scores.dtype).min
-            scores = scores.masked_fill(mask.unsqueeze(0), min_val)
-
-        # sliding window
-        if window_size is not None and window_size != (-1, -1):
-            left, right = window_size
-            q_pos = torch.arange(q_len, device=device)
-            center = (kv_len - q_len) + q_pos
-            k_pos = torch.arange(kv_len, device=device)
-
-            if left != -1:
-                ok_l = k_pos.view(1, -1) >= (center.view(-1, 1) - left)
-            else:
-                ok_l = torch.ones((q_len, kv_len), device=device, dtype=torch.bool)
-            if right != -1:
-                ok_r = k_pos.view(1, -1) <= (center.view(-1, 1) + right)
-            else:
-                ok_r = torch.ones((q_len, kv_len), device=device, dtype=torch.bool)
-
-            ok = ok_l & ok_r
-            min_val = torch.finfo(scores.dtype).min
-            scores = scores.masked_fill((~ok).unsqueeze(0), min_val)
-
-        # alibi (simple absolute diff version)
-        if alibi_slopes is not None:
-            slopes = alibi_slopes.to(compute_dtype).view(-1, 1, 1)  # [H,1,1]
-            q_pos = torch.arange(q_len, device=device).view(1, -1, 1)
-            k_pos = torch.arange(kv_len, device=device).view(1, 1, -1)
-            k_pos = k_pos - (kv_len - q_len)
-            pos_diff = (q_pos - k_pos).abs().to(compute_dtype)
-            scores = scores + (-slopes * pos_diff)
-
-        if softcap and softcap > 0:
-            scores = (scores / softcap).tanh() * softcap
-
-        # stable softmax
-        scores = scores - scores.max(dim=-1, keepdim=True).values
-        w = F.softmax(scores, dim=-1)
-        w = torch.nan_to_num(w, 0.0, 0.0, 0.0)
-
-        out_h = torch.matmul(w, vh)  # [H,q,D]
-        out_seq = out_h.permute(1, 0, 2).to(q.dtype)  # [q,H,D]
-        out[q_start:q_end] = out_seq
-
-    return out
-
 
 # -------------------------
 # Backend + metadata builder
@@ -617,7 +436,7 @@ class INT8PAGEDATTENMetadataBuilder(AttentionMetadataBuilder[INT8PAGEDATTENMetad
 
 
 # -------------------------
-# Impl
+# 主要实现
 # -------------------------
 
 class INT8PAttnImpl(AttentionImpl):
@@ -642,9 +461,8 @@ class INT8PAttnImpl(AttentionImpl):
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
 
-        if alibi_slopes is not None:
-            alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
-        self.alibi_slopes = alibi_slopes
+        # 禁用
+        self.alibi_slopes = None
 
         if sliding_window is None:
             self.sliding_window = (-1, -1)
@@ -763,8 +581,8 @@ class INT8PAttnImpl(AttentionImpl):
                 "INT8 kv-cache scales not initialized. do_kv_cache_update must run before forward."
             )
 
-            # descale shape: [batch, Hkv]
-            descale_shape = (attn_metadata.query_start_loc.shape[0] - 1, self.num_kv_heads)
+            
+            descale_shape = (attn_metadata.query_start_loc.shape[0] - 1, self.num_kv_heads) # [batch, Hkv]
             k_descale = self._int8_k_scale.view(1, -1).expand(descale_shape).contiguous()
             v_descale = self._int8_v_scale.view(1, -1).expand(descale_shape).contiguous()
 
@@ -788,12 +606,11 @@ class INT8PAttnImpl(AttentionImpl):
                 v_descale=v_descale,
             )
 
-        # Non-DCP: Use paged attention
+        # use paged attention
         seqused_k = attn_metadata.seq_lens[: attn_metadata.query_start_loc.shape[0] - 1]
         sliding_window_size = list(self.sliding_window) if self.sliding_window is not None else None
 
-        # If FA varlen func supports paged kv-cache with int8+descale, you can call it.
-        # Otherwise, use pytorch paged attention (this file provides it).
+        # 原本的算子调用
         if is_flash_attn_varlen_func_available() and not self.is_int8_kv:
             flash_attn_varlen_func(
                 q=query_actual,
@@ -816,27 +633,32 @@ class INT8PAttnImpl(AttentionImpl):
             )
             return output
 
-        # Pytorch paged attention (works for int8 kv-cache with descale)
+        # 使用新的INT8 PagedAttention
+        from vllm.v1.attention.backends.pagedint8_util import paged_attention_pytorch
         paged_attention_pytorch(
-            q=query_actual,
+            q=query_actual, # 这个类型应该是torch.bfloat16
             key_cache=key_cache,
             value_cache=value_cache,
             cu_seqlens_q=attn_metadata.query_start_loc,
-            block_table=attn_metadata.block_table,
-            seqused_k=seqused_k,
-            softmax_scale=self.scale,
-            causal=attn_metadata.causal,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            out=output_actual,
+            block_table=attn_metadata.block_table, # 块表
+            seqused_k=seqused_k, # 【batch】 每个序列的有效k长度（不包含padding）
+            softmax_scale=self.scale, # sqrt(d)
+            causal=attn_metadata.causal, 
+            k_descale=k_descale, # k反量化系数 [batch, Hkv]
+            v_descale=v_descale,    # v反量化系数 [batch, Hkv]
+            out=output_actual,  
             window_size=sliding_window_size,
             alibi_slopes=self.alibi_slopes,
             softcap=self.logits_soft_cap,
         )
+
+        # DEBUG
+        print(f"DTYPE IN FORWARD: query {query.dtype}, key_cache {key_cache.dtype}, value_cache {value_cache.dtype}, output {output.dtype}")
+        print(f"SHAPE IN FORWARD: query {query.shape}, key_cache {key_cache.shape}, value_cache {value_cache.shape}, output {output.shape}")
         return output
 
     # ---------------- KV cache update ----------------
-
+    # 这里是更新kv cache的函数，注意如果是int8 kv cache，在这里进行量化并写入cache；如果是非int8 kv cache，则不需要更新（因为上游已经更新好了）
     def do_kv_cache_update(
         self,
         layer: torch.nn.Module,
@@ -853,15 +675,22 @@ class INT8PAttnImpl(AttentionImpl):
         if self.is_int8_kv:
             # 1) init scales once (stop-gap)
             if self._int8_k_scale is None or self._int8_v_scale is None:
+                # key.shape通常是 [T, Hkv, D]（T=token数，Hkv=KV头数，D=头维度）
+                # dim=(0,2)：沿token维度(0)和头维度(D)取最大值，保留KV头维度(1)
                 k_abs_max = key.abs().amax(dim=(0, 2), keepdim=False)  # [Hkv]
                 v_abs_max = value.abs().amax(dim=(0, 2), keepdim=False)
+                
+                # 2) quantize: round + clamp
+                ## 量化
+                # x_int8 = round(x_fp32 / scale)  
                 self._int8_k_scale = (k_abs_max / 127.0).clamp_min(1e-6).to(key.device)
                 self._int8_v_scale = (v_abs_max / 127.0).clamp_min(1e-6).to(key.device)
 
             k_scale = self._int8_k_scale
             v_scale = self._int8_v_scale
 
-            # 2) quantize: round + clamp
+            # 反量化
+            # result_fp32 = result_int32 * (scale_x * scale_y)
             ks = k_scale.view(1, -1, 1)
             vs = v_scale.view(1, -1, 1)
 
@@ -872,6 +701,8 @@ class INT8PAttnImpl(AttentionImpl):
             key_cache_i8 = key_cache.view(torch.int8)
             value_cache_i8 = value_cache.view(torch.int8)
 
+            # 调用我们pytorch的实现
+            from vllm.v1.attention.backends.pagedint8_util import reshape_and_cache_flash_pytorch
             reshape_and_cache_flash_pytorch(
                 key_int8=key_int8,
                 value_int8=value_int8,
@@ -881,7 +712,7 @@ class INT8PAttnImpl(AttentionImpl):
             )
             return
 
-        # non-int8: use upstream
+        # 原本的实现（如果是非int8 kv cache，并且FA可用，则调用FA的reshape_and_cache；否则不做任何操作，假设上游已经正确更新了kv cache）
         if is_flash_attn_varlen_func_available():
             reshape_and_cache_flash(
                 key,
@@ -898,8 +729,7 @@ class INT8PAttnImpl(AttentionImpl):
         # fallback: do nothing
         return
 
-    # ---------------- DCP path (kept as-is, uses FA) ----------------
-
+    # 数据上下文并行data context parallel 这里先不用
     def _forward_with_dcp(
         self,
         query: torch.Tensor,
