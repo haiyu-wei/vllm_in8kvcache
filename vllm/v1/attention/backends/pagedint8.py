@@ -563,6 +563,7 @@ class INT8PAttnImpl(AttentionImpl):
             return output
 
         # ---------------- Decoder (Paged) ----------------
+        # 拆开kvcache
         key_cache, value_cache = kv_cache.unbind(0)
 
         query_actual = query[:num_actual_tokens]
@@ -574,14 +575,10 @@ class INT8PAttnImpl(AttentionImpl):
 
         # IMPORTANT: Do NOT dequantize whole cache here.
         if self.is_int8_kv:
-            key_cache = key_cache.view(torch.int8)
-            value_cache = value_cache.view(torch.int8)
-
-            assert self._int8_k_scale is not None and self._int8_v_scale is not None, (
-                "INT8 kv-cache scales not initialized. do_kv_cache_update must run before forward."
-            )
-
-            
+            # print(f"INT8 KV cache detected. using int8 paged attention with on-the-fly dequantization. query dtype: {query.dtype}, key_cache dtype: {key_cache.dtype}, value_cache dtype: {value_cache.dtype}")
+            # assert self._int8_k_scale is not None and self._int8_v_scale is not None, (
+            #     "INT8 kv-cache scales not initialized. do_kv_cache_update must run before forward."
+            # )
             descale_shape = (attn_metadata.query_start_loc.shape[0] - 1, self.num_kv_heads) # [batch, Hkv]
             k_descale = self._int8_k_scale.view(1, -1).expand(descale_shape).contiguous()
             v_descale = self._int8_v_scale.view(1, -1).expand(descale_shape).contiguous()
@@ -608,7 +605,8 @@ class INT8PAttnImpl(AttentionImpl):
 
         # use paged attention
         seqused_k = attn_metadata.seq_lens[: attn_metadata.query_start_loc.shape[0] - 1]
-        sliding_window_size = list(self.sliding_window) if self.sliding_window is not None else None
+        # 禁用了
+        sliding_window_size = None
 
         # 原本的算子调用
         if is_flash_attn_varlen_func_available() and not self.is_int8_kv:
