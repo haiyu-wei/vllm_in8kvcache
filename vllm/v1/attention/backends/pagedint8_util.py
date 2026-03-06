@@ -84,6 +84,7 @@ def paged_attention_pytorch(
 
         # 计算qk
         scores = torch.matmul(qh, kh.transpose(1, 2)) * softmax_scale  # [H,q,k]
+        print(f"DTYPES: qh={qh.dtype}, kh={kh.dtype}, scores={scores.dtype}")
 
         # causal mask (decoder-like, align q to the tail of kv)
         if causal:
