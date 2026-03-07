@@ -720,7 +720,7 @@ class INT8PAttnImpl(AttentionImpl):
                     self.num_heads,
                     self.num_kv_heads,
                     self.head_size,
-                    self.scale,
+                    self.scale, # softmax scale
                     attn_metadata.causal,
                     alibi_slopes=self.alibi_slopes,
                     window_size=window_size,
