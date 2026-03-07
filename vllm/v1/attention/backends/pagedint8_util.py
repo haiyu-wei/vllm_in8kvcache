@@ -8,397 +8,234 @@ import torch.nn.functional as F
 import numpy as np
 from einops import repeat, rearrange
 
-def _compute_dtype_for(q: torch.Tensor) -> torch.dtype:
-    # bfloat16 is safer in fp32 for stability
-    return torch.float32 if q.dtype == torch.bfloat16 else torch.float16
-
-def paged_attention_pytorch(
-    q: torch.Tensor,                         # [total_q, Hq, D]
-    key_cache: torch.Tensor,                 # [num_blocks, block_size, Hkv, D] int8 or fp
-    value_cache: torch.Tensor,               # same
-    cu_seqlens_q: torch.Tensor,              # [B+1]
-    block_table: torch.Tensor,               # [B, max_blocks]
-    seqused_k: torch.Tensor,                 # [B]  (kv length in tokens)
-    softmax_scale: float,
-    causal: bool,
-    k_descale: Optional[torch.Tensor],        # [B, Hkv] if cache int8 else None
-    v_descale: Optional[torch.Tensor],        # [B, Hkv] if cache int8 else None
-    out: torch.Tensor,
-    window_size: Optional[Tuple[int, int]] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    softcap: float = 0.0,
-) -> torch.Tensor:
+def flash_attn_varlen_func_pytorch(
+    q,
+    k,
+    v,
+    max_seqlen_q,
+    cu_seqlens_q,
+    max_seqlen_k,
+    cu_seqlens_k=None,
+    seqused_k=None,
+    q_v=None,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=None,
+    softcap=0.0,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    block_table=None,
+    return_softmax_lse=False,
+    out=None,
+    scheduler_metadata=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    num_splits=0,
+    fa_version=2,
+    s_aux=None,
+    cp_world_size=1,
+    cp_rank=0,
+    cp_tot_seqused_k=None,
+):
     """
-    Simple paged attention (PyTorch), matching vLLM paged-kv semantics.
-    Assumptions for simplicity:
-      - Hq == Hkv (no GQA/MQA). If you need GQA, add head broadcast.
-      - seqused_k gives total kv tokens available for each sequence.
-    """
-    device = q.device
-    B = cu_seqlens_q.numel() - 1
-    Hq = q.shape[1]
-    D = q.shape[2]
-    compute_dtype = _compute_dtype_for(q)
-
-    # 直接往out里写
-    for i in range(B):
-        q_start = int(cu_seqlens_q[i].item())
-        q_end = int(cu_seqlens_q[i + 1].item())
-        q_seq = q[q_start:q_end].to(compute_dtype)  # [q_len, H, D]
-        q_len = q_seq.shape[0]
-
-        kv_len = int(seqused_k[i].item())
-        if kv_len <= 0 or q_len == 0:
-            out[q_start:q_end].zero_()
-            continue
-
-        bt = block_table[i]  # [max_blocks]
-        blocks = bt[bt != -1]
-        if blocks.numel() == 0:
-            out[q_start:q_end].zero_()
-            continue
-
-        # gather blocks: [nb, block_size, Hkv, D]
-        kb = key_cache[blocks]
-        vb = value_cache[blocks]
-
-        # flatten tokens: [nb*block_size, Hkv, D] and truncate
-        k_flat = kb.reshape(-1, kb.shape[-2], kb.shape[-1])[:kv_len]
-        v_flat = vb.reshape(-1, vb.shape[-2], vb.shape[-1])[:kv_len]
-
-        # dequant if int8
-        if k_flat.dtype == torch.int8:
-            assert k_descale is not None and v_descale is not None
-            ks = k_descale[i].to(compute_dtype).view(1, -1, 1)  # [1,H,1]
-            vs = v_descale[i].to(compute_dtype).view(1, -1, 1)
-            k_seq = k_flat.to(compute_dtype) * ks
-            v_seq = v_flat.to(compute_dtype) * vs
-        else:
-            k_seq = k_flat.to(compute_dtype)
-            v_seq = v_flat.to(compute_dtype)
-
-        # [q_len,H,D] -> [H,q_len,D]
-        qh = q_seq.permute(1, 0, 2)
-        kh = k_seq.permute(1, 0, 2)
-        vh = v_seq.permute(1, 0, 2)
-
-        assert qh.shape[0] == kh.shape[0], "This simple impl assumes Hq == Hkv."
-
-        # 计算qk
-        scores = torch.matmul(qh, kh.transpose(1, 2)) * softmax_scale  # [H,q,k]
-        print(f"DTYPES: qh={qh.dtype}, kh={kh.dtype}, scores={scores.dtype}")
-
-        # causal mask (decoder-like, align q to the tail of kv)
-        if causal:
-            # key positions [0..kv_len-1], query positions correspond to [kv_len-q_len .. kv_len-1]
-            q_pos = torch.arange(q_len, device=device)
-            max_k = (kv_len - q_len) + q_pos  # [q_len]
-            k_pos = torch.arange(kv_len, device=device).view(1, -1)  # [1,kv]
-            mask = k_pos > max_k.view(-1, 1)  # [q_len,kv]
-            min_val = torch.finfo(scores.dtype).min
-            scores = scores.masked_fill(mask.unsqueeze(0), min_val)
-
-        if softcap and softcap > 0:
-            scores = (scores / softcap).tanh() * softcap
-
-        # safe softmax
-        scores = scores - scores.max(dim=-1, keepdim=True).values
-        w = F.softmax(scores, dim=-1)
-        w = torch.nan_to_num(w, 0.0, 0.0, 0.0)
-
-        out_h = torch.matmul(w, vh)  # [H,q,D]
-        out_seq = out_h.permute(1, 0, 2).to(q.dtype)  # [q,H,D]
-        out[q_start:q_end] = out_seq
-
-    return out
-
-
-
-def reshape_and_cache_flash_pytorch(
-    key_int8: torch.Tensor,        # [T, Hkv, D] (already int8)
-    value_int8: torch.Tensor,      # [T, Hkv, D] (already int8)
-    key_cache_i8: torch.Tensor,    # [num_blocks, block_size, Hkv, D] int8 view
-    value_cache_i8: torch.Tensor,  # same
-    slot_mapping: torch.Tensor,    # [T], slot = block_id * block_size + token_in_block, or -1 相当于cache的idx
-) -> None:
-    """
-    把已经量化成 INT8 的 K/V 序列（key_int8/value_int8），
-    按照slot_mapping指定的内存位置，写入到分页管理的 INT8 KV Cache（key_cache_i8/value_cache_i8）中。
-    """
-    slot_mapping = slot_mapping.flatten()
-    valid = slot_mapping >= 0
-    if valid.sum().item() == 0:
-        return
-
-    slots = slot_mapping[valid].to(torch.int64)
-    k = key_int8[valid]      # [N, Hkv, D]
-    v = value_int8[valid]
-
-    block_size = key_cache_i8.shape[1]
-    block_idx = slots // block_size
-    tok_idx = slots % block_size
-
-    with torch.no_grad():
-        key_cache_i8[block_idx, tok_idx] = k
-        value_cache_i8[block_idx, tok_idx] = v
-
-def dynamic_quantize_tensor_per_head(x, is_kv_cache=False):
-    """
-    动态对称量化 (Per-Head 版本)。
+    flash_attn_varlen_func 的PyTorch实现。
+    
+    此函数提供与vLLM flash attention接口兼容的纯PyTorch实现。
     
     Args:
-        x: 输入张量
-           - Q 的形状: [num_tokens, num_heads, head_dim] (3D)
-           - K/V Cache 的形状: [num_blocks, block_size, num_kv_heads, head_dim] (4D)
-        is_kv_cache: 输入是否为 4D 的 KV Cache
+        q: (total_q_tokens, num_heads, head_dim)
+        k: (num_blocks, block_size, num_kv_heads, head_dim) - KV缓存
+        v: (num_blocks, block_size, num_kv_heads, head_dim) - KV缓存
+        max_seqlen_q: int - 最大查询序列长度
+        cu_seqlens_q: (batch_size + 1,) - 查询的累积序列长度
+        max_seqlen_k: int - 最大键序列长度
+        cu_seqlens_k: 可选 - 键的累积序列长度（用于非分页预填充）
+        seqused_k: (batch_size,) - 实际使用的键序列长度
+        q_v: 可选 - 查询的值投影（此实现中未使用）
+        dropout_p: float - dropout概率
+        softmax_scale: float - 注意力分数的缩放因子
+        causal: bool - 是否应用因果掩码
+        window_size: 滑动窗口注意力的可选元组
+        softcap: float - 注意力分数的软上限值
+        alibi_slopes: ALiBi偏置的可选张量
+        deterministic: bool - 是否使用确定性dropout
+        return_attn_probs: bool - 是否返回注意力概率
+        block_table: (batch_size, max_blocks_per_seq) - 从序列到块的映射
+        return_softmax_lse: bool - 是否返回softmax logsumexp
+        out: 可选的输出张量
+        scheduler_metadata: 调度器元数据（在PyTorch实现中忽略）
+        q_descale, k_descale, v_descale: 量化输入的反缩放因子
+        num_splits: 注意力计算的分割数
+        fa_version: flash attention版本（在PyTorch实现中忽略）
+        s_aux: 辅助sink tokens
+        cp_world_size: 跨进程世界大小
+        cp_rank: 跨进程排名
+        cp_tot_seqused_k: 跨进程键的总序列使用量
     
     Returns:
-        x_int8: 量化后的 INT8 张量
-        scale: Per-Head 的 scale 张量
-               - Q: [1, num_heads, 1] (方便广播)
-               - KV Cache: [1, 1, num_kv_heads, 1]
+        output: (total_q_tokens, num_heads, head_dim)
+        如果 return_attn_probs=True: 同时返回注意力概率
+        如果 return_softmax_lse=True: 同时返回softmax logsumexp
     """
-    # 1. 强制转换为 FP32 以确保计算精度
-    x_fp32 = x.float()
-    
-    # 2. 确定在哪些维度上求最大值 (保留 Head 维度)
-    # 目标：对于每个 Head，算出它的最大值
-    if is_kv_cache:
-        # KV Cache 是 4D: [Blocks, BlockSize, Heads, Dim]
-        # 我们要在 dim=0, 1, 3 上求 max，保留 dim=2 (Heads)
-        dims_to_reduce = (0, 1, 3)
-        # 为了后续广播，scale 需要变成 [1, 1, num_kv_heads, 1]
-        scale_shape = (1, 1, x_fp32.size(2), 1)
-    else:
-        # Q/K/V 是 3D: [Tokens, Heads, Dim]
-        # 我们要在 dim=0, 2 上求 max，保留 dim=1 (Heads)
-        dims_to_reduce = (0, 2)
-        # 为了后续广播，scale 需要变成 [1, num_heads, 1]
-        scale_shape = (1, x_fp32.size(1), 1)
-
-    # 3. 计算 Per-Head 的绝对值最大值
-    # keepdim=True 非常重要，保留维度以便广播
-    abs_max = x_fp32.abs().amax(dim=dims_to_reduce, keepdim=True)
-    
-    # 4. 计算 Scale (映射到 [-127, 127])
-    scale = abs_max / 127.0
-    scale = torch.clamp(scale, min=1e-9) # 防止除零
-    
-    # 5. 执行量化
-    # 利用广播机制：x_fp32 / scale 会自动对齐维度
-    x_int8 = torch.round(x_fp32 / scale).clamp(-128, 127).to(torch.int8)
-    
-    # 6. 把 scale 展平成 vLLM FA 需要的形状 (可选，视后续接口需求)
-    # vLLM 通常需要 [batch, num_heads] 的 2D 形状
-    # 这里我们先返回带 keepdim 的版本，方便在 forward 里 reshape
-    
-    return x_int8, scale
-
-def dynamic_quantize_tensor(x_fp32):
-    """
-    动态对称量化：将 FP32 张量量化为 INT8。
-    公式： q = round(x / scale)
-    """
-    print(f"动态量化输入张量的 dtype: {x_fp32.dtype}, shape: {x_fp32.shape}")
-    print(f"x_fp32 统计: min={x_fp32.min().item():.4f}, max={x_fp32.max().item():.4f}, mean={x_fp32.mean().item():.4f}")
-    # 计算缩放因子：使用绝对值最大值映射到 INT8 范围 (-127, 127)
-    # 注意：保留 -128 以避免溢出风险，或者直接用 127.0
-    abs_max = x_fp32.abs().max()
-    scale = abs_max / 127.0 
-    
-    # 为了数值稳定性，如果全零则 scale 设为 1
-    scale = torch.clamp(scale, min=1e-9) 
-    
-    # 量化
-    x_int8 = torch.round(x_fp32 / scale).to(torch.int8)
-    print(f"量化完成: scale={scale.item():.6f}, x_int8 dtype: {x_int8.dtype}, shape: {x_int8.shape}")
-    print(f"x_int8 统计: min={x_int8.min().item()}, max={x_int8.max().item()}, mean={x_int8.float().mean().item():.4f}")
-
-
-    return x_int8, scale
-
-# =============================================================================
-# 3. 核心实现：支持 INT8 的 PyTorch Flash Attention Varlen
-# =============================================================================
-
-def flash_attn_varlen_func_pytorch_int8(
-    q, k, v,
-    max_seqlen_q, cu_seqlens_q, max_seqlen_k,
-    cu_seqlens_k=None, seqused_k=None, q_v=None,
-    dropout_p=0.0, softmax_scale=None, causal=False,
-    window_size=None, softcap=0.0, alibi_slopes=None,
-    deterministic=False, return_attn_probs=False,
-    block_table=None, return_softmax_lse=False,
-    out=None, scheduler_metadata=None,
-    q_descale=None, k_descale=None, v_descale=None, # INT8 反缩放因子
-    num_splits=0, fa_version=2, s_aux=None,
-    **kwargs
-):
     device = q.device
     dtype = q.dtype
     batch_size = len(cu_seqlens_q) - 1
     num_heads = q.shape[1]
+    num_kv_heads = k.shape[2]
     head_dim = q.shape[2]
     
     if softmax_scale is None:
-        softmax_scale = head_dim ** (-0.5)
+        softmax_scale = q.shape[-1] ** (-0.5)
+    
     if window_size is None:
         window_size = (-1, -1)
-
-    # --------------------------
-    # 关键修改：INT8 反量化入口
-    # --------------------------
-    # def maybe_dequantize(x, descale, name):
-    #     print(f"输入{name}的 dtype: {x.dtype}, shape: {x.shape}")
-    #     if x.dtype == torch.int8:
-    #         if descale is None:
-    #             raise ValueError(f"Input {name} is INT8 but {name}_descale is None!")
-    #         # 反量化回 FP32 进行计算
-    #         return x.to(torch.float32) * descale
-    #     return x.float()
-    def maybe_dequantize(x, descale, name):
-        print(f"输入{name}的 dtype: {x.dtype}, shape: {x.shape}")
-        if x.dtype == torch.int8:
-            if descale is None:
-                raise ValueError(f"Input {name} is INT8 but {name}_descale is None!")
-            
-            x_fp32 = x.to(torch.float32)
-            
-            # ---------------- 核心修复：形状广播适配 ----------------
-            # 确保 descale 是一个 tensor
-            if not torch.is_tensor(descale):
-                descale = torch.tensor(descale, device=x.device, dtype=torch.float32)
-                
-            # 分析 x 的形状，自动适配 descale 的维度
-            # 情况 1: x 是 3D (例如 Query: [TotalTokens, NumHeads, HeadDim])
-            if x.dim() == 3:
-                # descale 可能是 [] (标量) 或 [NumHeads]
-                # 将 descale 变为 [1, *, 1] 以便广播
-                if descale.dim() == 0:
-                    # 标量，无需处理
-                    pass 
-                elif descale.dim() == 1:
-                    # Per-Head: [Heads] -> [1, Heads, 1]
-                    descale = descale.view(1, -1, 1)
-            
-            # 情况 2: x 是 4D (例如 Paged KV Cache: [Blocks, BlockSize, NumKVHeads, HeadDim])
-            elif x.dim() == 4:
-                # descale 可能是 [] (标量) 或 [NumKVHeads]
-                if descale.dim() == 0:
-                    pass
-                elif descale.dim() == 1:
-                    # Per-Head: [Heads] -> [1, 1, Heads, 1]
-                    descale = descale.view(1, 1, -1, 1)
-            
-            # 执行反量化
-            return x_fp32 * descale
-            # --------------------------------------------------------
-            
-        return x.float()
-
-    q_fp32 = maybe_dequantize(q, q_descale, "q")
-    k_fp32 = maybe_dequantize(k, k_descale, "k")
-    v_fp32 = maybe_dequantize(v, v_descale, "v")
-    print(f"dequantized: q_fp32 dtype: {q_fp32.dtype}, k_fp32 dtype: {k_fp32.dtype}, v_fp32 dtype: {v_fp32.dtype}")
-    print(f"q_fp32 统计: min={q_fp32.min().item():.4f}, max={q_fp32.max().item():.4f}, mean={q_fp32.mean().item():.4f}"
-          f"\nk_fp32 统计: min={k_fp32.min().item():.4f}, max={k_fp32.max().item():.4f}, mean={k_fp32.mean().item():.4f}"
-            f"\nv_fp32 统计: min={v_fp32.min().item():.4f}, max={v_fp32.max().item():.4f}, mean={v_fp32.mean().item():.4f}")
     
-    # 判断 KV 格式
-    is_continuous_kv = len(k.shape) == 3
+    # 检查是否为连续KV数据模式（k的形状不是分页格式）
+    is_continuous_kv = len(k.shape) == 3  # (total_tokens, num_heads, head_dim)
+    
+    # 只有在分页KV数据模式下才需要block_table
     if not is_continuous_kv and block_table is None:
-        raise ValueError("block_table required for paged KV")
+        raise ValueError("block_table is required for paged KV cache")
     
-    block_size = k.shape[1] if not is_continuous_kv else 128
-
-    # --------------------------
-    # 数据重组 (Reformatting)
-    # --------------------------
-    
-    # 1. 重组 K
-    if is_continuous_kv:
-        num_kv_heads = k_fp32.shape[1]
-        k_batch = torch.zeros(batch_size, max_seqlen_k, num_kv_heads, head_dim, device=device, dtype=torch.float32)
-        v_batch = torch.zeros(batch_size, max_seqlen_k, num_kv_heads, head_dim, device=device, dtype=torch.float32)
-        for b in range(batch_size):
-            start = cu_seqlens_k[b].item()
-            end = cu_seqlens_k[b+1].item()
-            if end > start:
-                k_batch[b, :end-start] = k_fp32[start:end]
-                v_batch[b, :end-start] = v_fp32[start:end]
+    # 在分页模式下获取block_size，连续模式下使用默认值
+    if not is_continuous_kv:
+        block_size = k.shape[1]
     else:
-        num_kv_heads = k_fp32.shape[2]
-        k_batch = torch.zeros(batch_size, max_seqlen_k, num_kv_heads, head_dim, device=device, dtype=torch.float32)
-        v_batch = torch.zeros(batch_size, max_seqlen_k, num_kv_heads, head_dim, device=device, dtype=torch.float32)
-        for b in range(batch_size):
-            seq_len = seqused_k[b].item() if seqused_k is not None else max_seqlen_k
-            blocks = block_table[b]
-            for t in range(seq_len):
-                bid = blocks[t // block_size].item()
-                off = t % block_size
-                if 0 <= bid < k_fp32.shape[0]:
-                    k_batch[b, t] = k_fp32[bid, off]
-                    v_batch[b, t] = v_fp32[bid, off]
-
-    # 2. 重组 Q
-    q_batch = torch.zeros(batch_size, max_seqlen_q, num_heads, head_dim, device=device, dtype=torch.float32)
+        block_size = 128  # 连续数据模式下使用默认block_size
+    
+    q = q.float()
+    k = k.float()
+    v = v.float()
+    
+    # 检查是否为连续KV数据模式（k的形状不是分页格式）
+    is_continuous_kv = len(k.shape) == 3  # (total_tokens, num_heads, head_dim)
+    
+    if is_continuous_kv:
+        # 连续KV数据模式：k的形状是(total_tokens, num_heads, head_dim)
+        # 需要正确设置k_batch和v_batch的维度
+        num_heads_k = k.shape[1]  # 从输入数据获取实际的head数量
+        k_batch = torch.zeros(batch_size, max_seqlen_k, num_heads_k, head_dim, dtype=torch.float32, device=device)
+        v_batch = torch.zeros(batch_size, max_seqlen_k, num_heads_k, head_dim, dtype=torch.float32, device=device)
+        
+        # 连续KV数据模式：直接使用cu_seqlens_k索引
+        for batch_idx in range(batch_size):
+            k_start = cu_seqlens_k[batch_idx].item()
+            k_end = cu_seqlens_k[batch_idx + 1].item()
+            seq_len_k = k_end - k_start
+            
+            if seq_len_k > 0:
+                k_batch[batch_idx, :seq_len_k] = k[k_start:k_end]
+                v_batch[batch_idx, :seq_len_k] = v[k_start:k_end]
+    else:
+        # 分页KV数据模式：使用原来的维度设置
+        k_batch = torch.zeros(batch_size, max_seqlen_k, num_kv_heads, head_dim, dtype=torch.float32, device=device)
+        v_batch = torch.zeros(batch_size, max_seqlen_k, num_kv_heads, head_dim, dtype=torch.float32, device=device)
+        
+        # 分页KV数据模式：使用block_table索引
+        for batch_idx in range(batch_size):
+            seq_len = seqused_k[batch_idx].item() if seqused_k is not None else max_seqlen_k
+            blocks = block_table[batch_idx]
+            
+            for token_idx in range(seq_len):
+                block_idx = token_idx // block_size
+                block_offset = token_idx % block_size
+                
+                # 检查block_idx是否在blocks数组范围内
+                if block_idx < len(blocks):
+                    actual_block_idx = blocks[block_idx].item()
+                    
+                    if actual_block_idx >= 0 and actual_block_idx < k.shape[0]:
+                        k_batch[batch_idx, token_idx] = k[actual_block_idx, block_offset]
+                        v_batch[batch_idx, token_idx] = v[actual_block_idx, block_offset]
+    
+    q_batch = torch.zeros(batch_size, max_seqlen_q, num_heads, head_dim, dtype=torch.float32, device=device)
+    
+    # 处理查询序列
+    for batch_idx in range(batch_size):
+        q_start = cu_seqlens_q[batch_idx].item()
+        q_end = cu_seqlens_q[batch_idx + 1].item()
+        seq_len_q = q_end - q_start
+        if seq_len_q > 0:
+            q_batch[batch_idx, :seq_len_q] = q[q_start:q_end]
+    
     query_padding_mask = torch.zeros(batch_size, max_seqlen_q, dtype=torch.bool, device=device)
     key_padding_mask = torch.zeros(batch_size, max_seqlen_k, dtype=torch.bool, device=device)
     
-    for b in range(batch_size):
-        q_start = cu_seqlens_q[b].item()
-        q_end = cu_seqlens_q[b+1].item()
-        len_q = q_end - q_start
-        len_k = seqused_k[b].item() if seqused_k is not None else max_seqlen_k
+    for batch_idx in range(batch_size):
+        q_start = cu_seqlens_q[batch_idx].item()
+        q_end = cu_seqlens_q[batch_idx + 1].item()
+        seq_len_q = q_end - q_start
+        seq_len_k = seqused_k[batch_idx].item() if seqused_k is not None else max_seqlen_k
         
-        if len_q > 0:
-            q_batch[b, :len_q] = q_fp32[q_start:q_end]
-            query_padding_mask[b, :len_q] = True
-        if len_k > 0:
-            key_padding_mask[b, :len_k] = True
-
-    # --------------------------
-    # 注意力计算
-    # --------------------------
-    from einops import repeat, rearrange
-    # MQA/GQA 头扩展
-    if q_batch.shape[2] != k_batch.shape[2]:
-        g = q_batch.shape[2] // k_batch.shape[2]
+        if seq_len_q > 0:
+            query_padding_mask[batch_idx, :seq_len_q] = True
+        if seq_len_k > 0:
+            key_padding_mask[batch_idx, :seq_len_k] = True
+    
+    attn_bias = None
+    if alibi_slopes is not None:
+        row_idx = torch.arange(max_seqlen_q, device=device, dtype=torch.float32).unsqueeze(1)
+        col_idx = torch.arange(max_seqlen_k, device=device, dtype=torch.float32)
+        if causal:
+            attn_bias = (col_idx - row_idx) * alibi_slopes.unsqueeze(-1).unsqueeze(-1)
+        else:
+            attn_bias = -torch.abs(row_idx - col_idx) * alibi_slopes.unsqueeze(-1).unsqueeze(-1)
+    
+    # 确保k_batch和v_batch的头数正确扩展到匹配q_batch
+    num_heads_q = q_batch.shape[2]
+    num_heads_k = k_batch.shape[2]
+    if num_heads_q != num_heads_k:
+        g = num_heads_q // num_heads_k
         k_batch = repeat(k_batch, "b s h d -> b s (h g) d", g=g)
         v_batch = repeat(v_batch, "b s h d -> b s (h g) d", g=g)
-
+    
     output, attention = attention_ref(
-        q=q_batch, k=k_batch, v=v_batch,
+        q=q_batch,
+        k=k_batch,
+        v=v_batch,
         query_padding_mask=query_padding_mask,
         key_padding_mask=key_padding_mask,
-        causal=causal, window_size=window_size,
-        softcap=softcap, upcast=True
+        attn_bias=attn_bias,
+        dropout_p=dropout_p,
+        dropout_mask=None,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        upcast=False,
+        reorder_ops=False,
+        key_leftpad=None,
     )
-
-    # --------------------------
-    # 输出还原
-    # --------------------------
+    
+    # 重组输出
     outputs = []
-    for b in range(batch_size):
-        start = cu_seqlens_q[b].item()
-        end = cu_seqlens_q[b+1].item()
-        outputs.append(output[b, :end-start])
+    for batch_idx in range(batch_size):
+        q_start = cu_seqlens_q[batch_idx].item()
+        q_end = cu_seqlens_q[batch_idx + 1].item()
+        seq_len_q = q_end - q_start
+        # output shape: [batch, seq, heads, dim] -> 需要提取正确的序列部分
+        batch_output = output[batch_idx, :seq_len_q]  # [seq_len_q, heads, dim]
+        outputs.append(batch_output)
     
-    final_output = torch.cat(outputs, dim=0)
+    final_output = torch.cat(outputs, dim=0)  # [total_seq, heads, dim]
+    final_output = final_output.to(dtype)
     
-    # 注意：如果输入是 INT8，输出通常保持 FP32 以保留精度，除非后续有后量化
-    # 这里我们默认输出回输入的原始 dtype (如果是 FP16/BF16) 或者保持 FP32 (如果输入是 INT8)
-    if dtype != torch.int8:
-        final_output = final_output.to(dtype)
-    else:
-        final_output = final_output.to(torch.float32) # INT8 输入 -> FP32 输出是行业惯例
-
     if out is not None:
         out.copy_(final_output)
         final_output = out
-
-    return final_output
-
+    
+    result = [final_output]
+    
+    if return_softmax_lse:
+        softmax_lse = torch.logsumexp(attention, dim=-1)
+        result.append(softmax_lse)
+    
+    if return_attn_probs:
+        result.append(attention)
+    
+    return tuple(result) if len(result) > 1 else result[0]
 
 
 def attention_ref(
@@ -493,7 +330,6 @@ def attention_ref(
         output.masked_fill_(rearrange(torch.logical_not(torch.any(key_padding_mask, 1)), "b -> b 1 1 1"), 0.0)
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
-
 def construct_local_mask(
     seqlen_q,
     seqlen_k,
@@ -528,3 +364,198 @@ def construct_local_mask(
             col_idx < row_idx + sk - sq - window_size[0],
         )
 
+
+# -------- Int8 dynamic quant path: gather KV, quantize Q/K/V, simulate int8 attention --------
+
+
+def gather_kv_from_paged_cache(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather K, V from paged cache into contiguous [total_kv, num_kv_heads, head_dim]."""
+    # key_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+    batch_size = block_table.shape[0]
+    num_kv_heads = key_cache.shape[2]
+    head_dim = key_cache.shape[3]
+    device = key_cache.device
+    dtype = key_cache.dtype
+
+    total_kv = seqused_k.sum().item()
+    k_contig = torch.zeros(
+        (total_kv, num_kv_heads, head_dim), dtype=dtype, device=device
+    )
+    v_contig = torch.zeros(
+        (total_kv, num_kv_heads, head_dim), dtype=dtype, device=device
+    )
+
+    offset = 0
+    for batch_idx in range(batch_size):
+        seq_len = seqused_k[batch_idx].item()
+        blocks = block_table[batch_idx]
+        for token_idx in range(seq_len):
+            block_idx = token_idx // block_size
+            block_offset = token_idx % block_size
+            if block_idx < blocks.shape[0]:
+                physical_block = blocks[block_idx].item()
+                if physical_block >= 0:
+                    k_contig[offset] = key_cache[physical_block, block_offset]
+                    v_contig[offset] = value_cache[physical_block, block_offset]
+            offset += 1
+    return k_contig, v_contig
+
+
+def dynamic_quantize_to_int8_per_head(
+    x: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize x to int8 with per-head scale (scale = max(abs(x)) / 127 for each head).
+    x: [..., num_heads, head_dim] or [..., num_kv_heads, head_dim].
+    Returns (x_int8, scale) where scale is [num_heads] or [num_kv_heads].
+    """
+    # x: [N, H, D] -> per-head scale over all tokens and head_dim, shape (h,)
+    n, h, d = x.shape[0], x.shape[1], x.shape[2]
+    x_flat = x.float().view(n, h, -1)
+    scale = x_flat.abs().amax(dim=(0, -1), keepdim=False).clamp(min=1e-8) / 127.0
+    x_scaled = (x.float() / scale.unsqueeze(0).unsqueeze(-1)).round().clamp(
+        -128, 127
+    )
+    x_int8 = x_scaled.to(torch.int8)
+    return x_int8, scale.float()
+
+
+def int8_attention_varlen_simulate(
+    q_int8: torch.Tensor,
+    k_int8: torch.Tensor,
+    v_int8: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    softmax_scale: float,
+    causal: bool,
+    alibi_slopes: torch.Tensor | None = None,
+    window_size: tuple[int | None, int | None] = (-1, -1),
+    logits_soft_cap: float = 0.0,
+) -> torch.Tensor:
+    """
+    Simulate int8 attention: no dequant of Q/K/V before matmul.
+    - scores_i32 = Q_i8 @ K_i8^T, then logits = scores_i32 * (q_scale * k_scale / sqrt(d))
+    - softmax(logits)
+    - output = (attn @ V_i8) * v_scale
+    Q/K/V are int8; scales applied only after integer matmul to mimic real int8 kernel.
+    """
+    device = q_int8.device
+    # K/V are contiguous [total_kv, num_kv_heads, head_dim] with batch 0, then 1, ...
+    total_kv = k_int8.shape[0]
+    cu_seqlens_k = torch.zeros(batch_size + 1, dtype=torch.int64, device=device)
+    offset = 0
+    for b in range(batch_size):
+        cu_seqlens_k[b] = offset
+        offset += seqused_k[b].item()
+    cu_seqlens_k[batch_size] = offset
+
+    q_batch = torch.zeros(
+        batch_size, max_seqlen_q, num_heads, head_dim,
+        dtype=torch.float32, device=device
+    )
+    k_batch = torch.zeros(
+        batch_size, max_seqlen_k, num_kv_heads, head_dim,
+        dtype=torch.float32, device=device
+    )
+    v_batch = torch.zeros(
+        batch_size, max_seqlen_k, num_kv_heads, head_dim,
+        dtype=torch.float32, device=device
+    )
+
+    for b in range(batch_size):
+        q_start = cu_seqlens_q[b].item()
+        q_end = cu_seqlens_q[b + 1].item()
+        k_start = cu_seqlens_k[b].item()
+        k_end = cu_seqlens_k[b + 1].item()
+        sq, sk = q_end - q_start, k_end - k_start
+        if sq > 0:
+            q_batch[b, :sq] = q_int8[q_start:q_end].float()
+        if sk > 0:
+            k_batch[b, :sk] = k_int8[k_start:k_end].float()
+            v_batch[b, :sk] = v_int8[k_start:k_end].float()
+
+    if num_heads != num_kv_heads:
+        g = num_heads // num_kv_heads
+        k_batch = repeat(k_batch, "b s h d -> b s (h g) d", g=g)
+        v_batch = repeat(v_batch, "b s h d -> b s (h g) d", g=g)
+
+    # Simulate int8: matmul with int8 values (no dequant before matmul), then scale result
+    # scores = (Q_i8 @ K_i8^T) * (q_scale * k_scale / sqrt(d))
+    d = head_dim
+    n_heads_q = q_batch.shape[2]
+    n_heads_kv = k_batch.shape[2]
+    scores = torch.einsum("bthd,bshd->bhts", q_batch, k_batch)
+    q_scale_ = q_scale.view(-1).float().to(device)
+    k_scale_ = k_scale.view(-1).float().to(device)
+    if q_scale_.numel() == 1:
+        q_scale_ = q_scale_.expand(n_heads_q)
+    if k_scale_.numel() == 1:
+        k_scale_ = k_scale_.expand(n_heads_kv)
+    if n_heads_q != n_heads_kv:
+        k_scale_ = k_scale_.repeat(n_heads_q // n_heads_kv)
+    scale_scores = (
+        q_scale_.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+        * k_scale_.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+        * softmax_scale
+    )
+    scores = scores.float() * scale_scores.to(scores.device)
+    if logits_soft_cap > 0:
+        scores = (scores / logits_soft_cap).tanh() * logits_soft_cap
+    if alibi_slopes is not None:
+        row = torch.arange(max_seqlen_q, device=device, dtype=torch.float32)
+        col = torch.arange(max_seqlen_k, device=device, dtype=torch.float32)
+        if causal:
+            bias = (col - row).unsqueeze(0).unsqueeze(0) * alibi_slopes.view(
+                1, -1, 1, 1
+            )
+        else:
+            bias = -torch.abs(col - row).unsqueeze(0).unsqueeze(0) * alibi_slopes.view(1, -1, 1, 1)
+        scores = scores + bias.to(scores.dtype)
+
+    if causal and max_seqlen_q > 1:
+        # Prefill: mask future keys (col > row). Decode (max_seqlen_q==1): single query
+        # must attend to all keys, so do not mask.
+        mask = torch.arange(max_seqlen_k, device=device).unsqueeze(0) > torch.arange(
+            max_seqlen_q, device=device
+        ).unsqueeze(1)
+        scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+    for b in range(batch_size):
+        sk = seqused_k[b].item()
+        if sk < max_seqlen_k:
+            scores[b, :, :, sk:] = float("-inf")
+
+    attn = F.softmax(scores, dim=-1)
+    # Simulate int8: (attn @ V_i8) then * v_scale, no dequant of V before matmul
+    out = torch.einsum("bhts,bshd->bthd", attn, v_batch)
+    v_scale_ = v_scale.view(-1).float().to(device)
+    if v_scale_.numel() == 1:
+        v_scale_ = v_scale_.expand(out.shape[2])
+    elif v_scale_.numel() == num_kv_heads and out.shape[2] != num_kv_heads:
+        v_scale_ = v_scale_.repeat(out.shape[2] // num_kv_heads)
+    out = out.float() * v_scale_.view(1, 1, -1, 1).to(out.device)
+    out_flat = []
+    for b in range(batch_size):
+        q_start = cu_seqlens_q[b].item()
+        q_end = cu_seqlens_q[b + 1].item()
+        sq = q_end - q_start
+        if sq > 0:
+            out_flat.append(out[b, :sq])
+    return torch.cat(out_flat, dim=0)

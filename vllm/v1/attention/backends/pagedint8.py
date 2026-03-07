@@ -157,10 +157,8 @@ class Int8PageAttentionBackend(AttentionBackend):
         if kv_cache_dtype is None:
             return True
         if kv_cache_dtype.startswith("fp8"):
-            return True
-        if kv_cache_dtype == "int8":
-            return True
-        return kv_cache_dtype in ["auto", "bfloat16"]
+            return flash_attn_supports_fp8()
+        return kv_cache_dtype in ["auto", "bfloat16", "int8"]
 
     @classmethod
     def supports_sink(cls) -> bool:
@@ -190,7 +188,7 @@ class Int8PageAttentionBackend(AttentionBackend):
 
 
 @dataclass
-class INT8PAGEDATTENMetadata:
+class FlashAttentionMetadata:
     # NOTE(sang): Definition of context_len, query_len, and seq_len.
     # |---------- N-1 iteration --------|
     # |---------------- N iteration ---------------------|
@@ -238,7 +236,7 @@ def _get_sliding_window_configs(
     return sliding_window_configs
 
 
-class INT8PAGEDATTENMetadataBuilder(AttentionMetadataBuilder[INT8PAGEDATTENMetadata]):
+class INT8PAGEDATTENMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetadata]):
     # FA3:
     # Supports full cudagraphs for all cases.
     #
@@ -347,7 +345,7 @@ class INT8PAGEDATTENMetadataBuilder(AttentionMetadataBuilder[INT8PAGEDATTENMetad
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> INT8PAGEDATTENMetadata:
+    ) -> FlashAttentionMetadata:
         """
         fast_build disables AOT scheduling, used when there will be few
         iterations i.e. spec-decode
@@ -505,7 +503,7 @@ class INT8PAGEDATTENMetadataBuilder(AttentionMetadataBuilder[INT8PAGEDATTENMetad
             self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
-        attn_metadata = INT8PAGEDATTENMetadata(
+        attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
             query_start_loc=query_start_loc,
@@ -529,10 +527,10 @@ class INT8PAGEDATTENMetadataBuilder(AttentionMetadataBuilder[INT8PAGEDATTENMetad
 
     def update_block_table(
         self,
-        metadata: INT8PAGEDATTENMetadata,
+        metadata: FlashAttentionMetadata,
         blk_table: torch.Tensor,
         slot_mapping: torch.Tensor,
-    ) -> INT8PAGEDATTENMetadata:
+    ) -> FlashAttentionMetadata:
         new_metadata = copy.copy(metadata)
         new_metadata.block_table = blk_table
         new_metadata.slot_mapping = slot_mapping
@@ -586,9 +584,6 @@ class INT8PAttnImpl(AttentionImpl):
         # Cache the batch invariant result for use in forward passes
         self.batch_invariant_enabled = vllm_is_batch_invariant()
 
-        self.key_cache_scale = 1.0
-        self.value_cache_scale = 1.0
-
         if is_quantized_kv_cache(self.kv_cache_dtype) and not flash_attn_supports_fp8():
             raise NotImplementedError(
                 "FlashAttention does not support fp8 kv-cache on this device."
@@ -613,7 +608,7 @@ class INT8PAttnImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: INT8PAGEDATTENMetadata,
+        attn_metadata: FlashAttentionMetadata,
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
@@ -676,65 +671,99 @@ class INT8PAttnImpl(AttentionImpl):
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
 
-        # if self.kv_cache_dtype.startswith("int8"):
-            # queries are quantized in the attention layer
-            # dtype = FlashAttentionBackend.get_fp8_dtype_for_flashattn(
-            #     self.kv_cache_dtype
-            # )
-            # key_cache = key_cache.view(dtype)
-            # value_cache = value_cache.view(dtype)
-        cu_seqlens_q = attn_metadata.query_start_loc
-        seqused_k = attn_metadata.seq_lens
-        max_seqlen_q = attn_metadata.max_query_len
-        max_seqlen_k = attn_metadata.max_seq_len
-        block_table = attn_metadata.block_table
-        scheduler_metadata = attn_metadata.scheduler_metadata
-        sliding_window_size = (
-            list(self.sliding_window)
-            if self.sliding_window is not None
-            else None
-        )
-
-        descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
-
-        q_descale = layer._q_scale.expand(descale_shape)
-        k_descale = layer._k_scale.expand(descale_shape)
-        v_descale = layer._v_scale.expand(descale_shape)
-        from vllm.v1.attention.backends.pagedint8_util import dynamic_quantize_tensor_per_head
-        q_i8, q_descale = dynamic_quantize_tensor_per_head(query[:num_actual_tokens])
-        kc_i8, k_descale = dynamic_quantize_tensor_per_head(key_cache, is_kv_cache=True)
-        vc_i8, v_descale = dynamic_quantize_tensor_per_head(value_cache, is_kv_cache=True)
-
-        self.key_cache_scale = k_descale
-        self.value_cache_scale = v_descale
-
-
-        from vllm.v1.attention.backends.pagedint8_util import flash_attn_varlen_func_pytorch_int8
-        flash_attn_varlen_func_pytorch_int8(
-                q=q_i8,
-                k=kc_i8,
-                v=vc_i8,
-                out=output[:num_actual_tokens],
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_q=max_seqlen_q,
-                seqused_k=seqused_k,
-                max_seqlen_k=max_seqlen_k,
+        # Dynamic int8 path: KV cache stays float; quantize Q and gathered K,V to int8
+        # before calling PyTorch op that simulates real int8 attention (no dequant in op).
+        if not self.kv_cache_dtype.startswith("fp8"):
+            if not attn_metadata.use_cascade:
+                cu_seqlens_q = attn_metadata.query_start_loc
+                seqused_k = attn_metadata.seq_lens
+                max_seqlen_q = attn_metadata.max_query_len
+                max_seqlen_k = attn_metadata.max_seq_len
+                block_table = attn_metadata.block_table
+                block_size = key_cache.shape[1]
+                batch_size = cu_seqlens_q.shape[0] - 1
+                from vllm.v1.attention.backends.pagedint8_util import (
+                    gather_kv_from_paged_cache,
+                    dynamic_quantize_to_int8_per_head,
+                    int8_attention_varlen_simulate,
+                )
+                k_contig, v_contig = gather_kv_from_paged_cache(
+                    key_cache, value_cache, block_table, seqused_k, block_size
+                )
+                q_f = query[:num_actual_tokens]
+                q_int8, q_scale = dynamic_quantize_to_int8_per_head(
+                    q_f, self.num_heads, self.head_size
+                )
+                k_int8, k_scale = dynamic_quantize_to_int8_per_head(
+                    k_contig, self.num_kv_heads, self.head_size
+                )
+                v_int8, v_scale = dynamic_quantize_to_int8_per_head(
+                    v_contig, self.num_kv_heads, self.head_size
+                )
+                window_size = (
+                    list(self.sliding_window)
+                    if self.sliding_window is not None
+                    else (-1, -1)
+                )
+                out_float = int8_attention_varlen_simulate(
+                    q_int8,
+                    k_int8,
+                    v_int8,
+                    q_scale,
+                    k_scale,
+                    v_scale,
+                    cu_seqlens_q,
+                    seqused_k,
+                    batch_size,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_size,
+                    self.scale,
+                    attn_metadata.causal,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=window_size,
+                    logits_soft_cap=self.logits_soft_cap,
+                )
+                output[:num_actual_tokens].copy_(out_float.to(output.dtype))
+                return output
+            # Cascade: keep float KV path
+            cascade_attention(
+                output[:num_actual_tokens],
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                cu_query_lens=attn_metadata.query_start_loc,
+                max_query_len=attn_metadata.max_query_len,
+                cu_prefix_query_lens=attn_metadata.cu_prefix_query_lens,
+                prefix_kv_lens=attn_metadata.prefix_kv_lens,
+                suffix_kv_lens=attn_metadata.suffix_kv_lens,
+                max_kv_len=attn_metadata.max_seq_len,
                 softmax_scale=self.scale,
-                causal=attn_metadata.causal,
                 alibi_slopes=self.alibi_slopes,
-                window_size=sliding_window_size,
-                block_table=block_table,
-                softcap=self.logits_soft_cap,
-                scheduler_metadata=scheduler_metadata,
+                sliding_window=self.sliding_window,
+                logits_soft_cap=self.logits_soft_cap,
+                block_table=attn_metadata.block_table,
+                common_prefix_len=attn_metadata.common_prefix_len,
+                max_num_splits=attn_metadata.max_num_splits,
                 fa_version=self.vllm_flash_attn_version,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                num_splits=attn_metadata.max_num_splits,
+                prefix_scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
+                suffix_scheduler_metadata=attn_metadata.scheduler_metadata,
+                q_descale=layer._q_scale,
+                k_descale=layer._k_scale,
+                v_descale=layer._v_scale,
                 s_aux=self.sinks,
             )
-        return output
-            
+            return output
+
+        if self.kv_cache_dtype.startswith("fp8"):
+            # queries are quantized in the attention layer
+            dtype = Int8PageAttentionBackend.get_fp8_dtype_for_flashattn(
+                self.kv_cache_dtype
+            )
+            key_cache = key_cache.view(dtype)
+            value_cache = value_cache.view(dtype)
 
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc
@@ -770,7 +799,8 @@ class INT8PAttnImpl(AttentionImpl):
                     if self.sliding_window is not None
                     else None
                 )
-                flash_attn_varlen_func(
+                from vllm.v1.attention.backends.pagedint8_util import flash_attn_varlen_func_pytorch
+                flash_attn_varlen_func_pytorch(
                     q=query[:num_actual_tokens],
                     k=key_cache,
                     v=value_cache,
@@ -865,7 +895,7 @@ class INT8PAttnImpl(AttentionImpl):
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         output: torch.Tensor,
-        attn_metadata: INT8PAGEDATTENMetadata,
+        attn_metadata: FlashAttentionMetadata,
         q_descale: torch.Tensor | None = None,
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
@@ -952,7 +982,7 @@ class INT8PAttnImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         output: torch.Tensor,
-        attn_metadata: INT8PAGEDATTENMetadata,
+        attn_metadata: FlashAttentionMetadata,
         layer: torch.nn.Module,
     ) -> torch.Tensor:
         """Forward pass for encoder attention without KV cache.
